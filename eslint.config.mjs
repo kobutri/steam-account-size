@@ -5,5 +5,5 @@ import convexPlugin from '@convex-dev/eslint-plugin'
 export default defineConfig([
   ...tanstackConfig,
   ...convexPlugin.configs.recommended,
-  globalIgnores(['.venv/**', '.output/**', 'convex/_generated']),
+  globalIgnores(['.venv/**', '.output/**', '.vercel/**', 'convex/_generated']),
 ])

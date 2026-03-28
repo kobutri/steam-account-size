@@ -8,6 +8,7 @@
     "dev:web": "vite dev",
     "dev:ts": "tsc -b -w",
     "dev:convex": "npx convex dev",
+    "vercel-build": "sh ./scripts/vercel-build.sh",
     "build": "vite build && tsc --noEmit",
     "start": "node .output/server/index.mjs",
     "format": "prettier --write .",
