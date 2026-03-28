@@ -1,10 +1,16 @@
-import { useDeferredValue, useMemo, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useDeferredValue, useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useAction } from 'convex/react'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, stripSearchParams } from '@tanstack/react-router'
 import { api } from '../../convex/_generated/api'
+import type { HomeSearch } from '~/lib/homeSearch'
+import { homeSearchDefaults, validateHomeSearch } from '~/lib/homeSearch'
 
 export const Route = createFileRoute('/')({
+  validateSearch: validateHomeSearch,
+  search: {
+    middlewares: [stripSearchParams(homeSearchDefaults)],
+  },
   head: () => ({
     meta: [
       {
@@ -16,25 +22,26 @@ export const Route = createFileRoute('/')({
 })
 
 function Home() {
+  const search = Route.useSearch()
   const lookupAccount = useAction(api.steam.lookupAccount)
-  const [account, setAccount] = useState('')
-  const [search, setSearch] = useState('')
-  const [hideFreeToPlay, setHideFreeToPlay] = useState(false)
-  const deferredSearch = useDeferredValue(search)
+  const { setAccount, setFilter, setHideFreeToPlay } = useHomeSearchState()
+  const deferredSearch = useDeferredValue(search.filter)
 
-  const lookupMutation = useMutation({
-    mutationFn: async (value: string) => {
-      return lookupAccount({ account: value })
+  const lookupQuery = useQuery({
+    queryKey: ['steam-account', search.account],
+    enabled: search.account.trim().length > 0,
+    queryFn: async () => {
+      return lookupAccount({ account: search.account.trim() })
     },
   })
 
   const visibleBaseGames = useMemo(() => {
-    const games = lookupMutation.data?.games ?? []
-    if (!hideFreeToPlay) {
+    const games = lookupQuery.data?.games ?? []
+    if (!search.hideFreeToPlay) {
       return games
     }
     return games.filter((game) => !game.isFreeToPlay)
-  }, [hideFreeToPlay, lookupMutation.data?.games])
+  }, [lookupQuery.data?.games, search.hideFreeToPlay])
 
   const filteredGames = useMemo(() => {
     const query = deferredSearch.trim().toLowerCase()
@@ -55,12 +62,12 @@ function Home() {
   }, [visibleBaseGames])
 
   const freeToPlayCount = useMemo(() => {
-    const games = lookupMutation.data?.games ?? []
+    const games = lookupQuery.data?.games ?? []
     return games.filter((game) => game.isFreeToPlay).length
-  }, [lookupMutation.data?.games])
+  }, [lookupQuery.data?.games])
 
   const summaryText = useMemo(() => {
-    if (!lookupMutation.data) {
+    if (!lookupQuery.data) {
       return null
     }
 
@@ -69,21 +76,21 @@ function Home() {
       `${visibleBaseGames.length.toLocaleString()} games`,
     ]
 
-    if (hideFreeToPlay && freeToPlayCount > 0) {
+    if (search.hideFreeToPlay && freeToPlayCount > 0) {
       parts.push(`${freeToPlayCount.toLocaleString()} free-to-play hidden`)
     }
 
-    if (lookupMutation.data.missingGames > 0) {
+    if (lookupQuery.data.missingGames > 0) {
       parts.push(
-        `${lookupMutation.data.missingGames.toLocaleString()} missing estimates`,
+        `${lookupQuery.data.missingGames.toLocaleString()} missing estimates`,
       )
     }
 
     return parts.join('  /  ')
   }, [
     freeToPlayCount,
-    hideFreeToPlay,
-    lookupMutation.data,
+    lookupQuery.data,
+    search.hideFreeToPlay,
     visibleBaseGames.length,
     visibleTotalBytes,
   ])
@@ -100,53 +107,42 @@ function Home() {
         className="mt-6 flex flex-col gap-3 sm:flex-row"
         onSubmit={(event) => {
           event.preventDefault()
-          if (!account.trim()) {
+          const formData = new FormData(event.currentTarget)
+          const nextAccount = String(formData.get('account') ?? '').trim()
+
+          if (nextAccount === search.account.trim()) {
+            if (nextAccount) {
+              void lookupQuery.refetch()
+            }
             return
           }
-          lookupMutation.reset()
-          void lookupMutation.mutateAsync(account.trim())
+
+          void setAccount(nextAccount)
         }}
       >
         <label className="sr-only" htmlFor="steam-account">
           Steam account
         </label>
         <input
+          key={search.account}
           id="steam-account"
-          value={account}
-          onChange={(event) => setAccount(event.target.value)}
+          name="account"
+          defaultValue={search.account}
           placeholder="https://steamcommunity.com/id/yourname/"
           className="h-11 flex-1 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900"
         />
         <button
           type="submit"
-          disabled={lookupMutation.isPending || !account.trim()}
+          disabled={lookupQuery.isFetching}
           className="h-11 border border-neutral-900 px-4 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {lookupMutation.isPending ? 'Loading…' : 'Lookup'}
+          {lookupQuery.isFetching ? 'Loading…' : 'Lookup'}
         </button>
       </form>
 
-      <div className="mt-4 flex flex-col gap-3 border-t border-neutral-200 pt-4 text-sm text-neutral-700 sm:flex-row sm:items-center sm:justify-between">
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={hideFreeToPlay}
-            onChange={(event) => setHideFreeToPlay(event.target.checked)}
-            className="h-4 w-4"
-          />
-          Hide free-to-play games
-        </label>
-        <input
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Filter games"
-          className="h-10 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900 sm:w-64"
-        />
-      </div>
-
-      {lookupMutation.error ? (
+      {lookupQuery.error ? (
         <p className="mt-4 text-sm text-red-700">
-          {lookupMutation.error.message}
+          {lookupQuery.error.message}
         </p>
       ) : null}
 
@@ -154,20 +150,24 @@ function Home() {
         <p className="mt-6 text-sm text-neutral-700">{summaryText}</p>
       ) : null}
 
-      {lookupMutation.data ? (
+      {lookupQuery.data ? (
         <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <label className="flex items-center gap-2 text-sm text-neutral-700">
             <input
               type="checkbox"
-              checked={hideFreeToPlay}
-              onChange={(event) => setHideFreeToPlay(event.target.checked)}
+              checked={search.hideFreeToPlay}
+              onChange={(event) => {
+                void setHideFreeToPlay(event.target.checked)
+              }}
               className="h-4 w-4"
             />
             Hide free-to-play
           </label>
           <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            value={search.filter}
+            onChange={(event) => {
+              void setFilter(event.target.value)
+            }}
             placeholder="Filter games"
             className="h-10 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900 sm:w-64"
           />
@@ -195,7 +195,7 @@ function Home() {
             ) : (
               <tr>
                 <td colSpan={2} className="py-8 text-center text-neutral-500">
-                  {lookupMutation.data
+                  {lookupQuery.data
                     ? 'No games match the current filters.'
                     : 'Run a lookup to load games.'}
                 </td>
@@ -206,6 +206,30 @@ function Home() {
       </section>
     </main>
   )
+}
+
+function useHomeSearchState() {
+  const navigate = Route.useNavigate()
+
+  const updateSearch = (
+    updater: (prev: HomeSearch) => HomeSearch,
+    opts?: { replace?: boolean },
+  ) => {
+    return navigate({
+      to: '/',
+      search: updater,
+      replace: opts?.replace,
+    })
+  }
+
+  return {
+    setAccount: (account: string) =>
+      updateSearch((prev) => ({ ...prev, account })),
+    setFilter: (filter: string) =>
+      updateSearch((prev) => ({ ...prev, filter }), { replace: true }),
+    setHideFreeToPlay: (hideFreeToPlay: boolean) =>
+      updateSearch((prev) => ({ ...prev, hideFreeToPlay }), { replace: true }),
+  }
 }
 
 function formatBytes(numBytes: number) {
