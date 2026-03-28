@@ -1,120 +1,223 @@
-import { Link, createFileRoute } from '@tanstack/react-router'
-import { useMutation } from 'convex/react'
-import { useSuspenseQuery } from '@tanstack/react-query'
-import { convexQuery } from '@convex-dev/react-query'
+import { useDeferredValue, useMemo, useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
+import { useAction } from 'convex/react'
+import { createFileRoute } from '@tanstack/react-router'
 import { api } from '../../convex/_generated/api'
 
 export const Route = createFileRoute('/')({
+  head: () => ({
+    meta: [
+      {
+        title: 'Steam Account Size',
+      },
+    ],
+  }),
   component: Home,
 })
 
 function Home() {
-  const {
-    data: { viewer, numbers },
-  } = useSuspenseQuery(convexQuery(api.myFunctions.listNumbers, { count: 10 }))
+  const lookupAccount = useAction(api.steam.lookupAccount)
+  const [account, setAccount] = useState('')
+  const [search, setSearch] = useState('')
+  const [hideFreeToPlay, setHideFreeToPlay] = useState(false)
+  const deferredSearch = useDeferredValue(search)
 
-  const addNumber = useMutation(api.myFunctions.addNumber)
+  const lookupMutation = useMutation({
+    mutationFn: async (value: string) => {
+      return lookupAccount({ account: value })
+    },
+  })
+
+  const visibleBaseGames = useMemo(() => {
+    const games = lookupMutation.data?.games ?? []
+    if (!hideFreeToPlay) {
+      return games
+    }
+    return games.filter((game) => !game.isFreeToPlay)
+  }, [hideFreeToPlay, lookupMutation.data?.games])
+
+  const filteredGames = useMemo(() => {
+    const query = deferredSearch.trim().toLowerCase()
+    if (!query) {
+      return visibleBaseGames
+    }
+    return visibleBaseGames.filter((game) =>
+      game.name.toLowerCase().includes(query),
+    )
+  }, [deferredSearch, visibleBaseGames])
+
+  const visibleTotalBytes = useMemo(() => {
+    let total = 0
+    for (const game of visibleBaseGames) {
+      total += game.estimatedSizeBytes
+    }
+    return total
+  }, [visibleBaseGames])
+
+  const freeToPlayCount = useMemo(() => {
+    const games = lookupMutation.data?.games ?? []
+    return games.filter((game) => game.isFreeToPlay).length
+  }, [lookupMutation.data?.games])
+
+  const summaryText = useMemo(() => {
+    if (!lookupMutation.data) {
+      return null
+    }
+
+    const parts = [
+      `${formatBytes(visibleTotalBytes)} total`,
+      `${visibleBaseGames.length.toLocaleString()} games`,
+    ]
+
+    if (hideFreeToPlay && freeToPlayCount > 0) {
+      parts.push(`${freeToPlayCount.toLocaleString()} free-to-play hidden`)
+    }
+
+    if (lookupMutation.data.missingGames > 0) {
+      parts.push(
+        `${lookupMutation.data.missingGames.toLocaleString()} missing estimates`,
+      )
+    }
+
+    return parts.join('  /  ')
+  }, [
+    freeToPlayCount,
+    hideFreeToPlay,
+    lookupMutation.data,
+    visibleBaseGames.length,
+    visibleTotalBytes,
+  ])
 
   return (
-    <main className="p-8 flex flex-col gap-16">
-      <h1 className="text-4xl font-bold text-center">
-        Convex + Tanstack Start
-      </h1>
-      <div className="flex flex-col gap-8 max-w-lg mx-auto">
-        <p>Welcome {viewer ?? 'Anonymous'}!</p>
-        <p>
-          Click the button below and open this page in another window - this
-          data is persisted in the Convex cloud database!
-        </p>
-        <p>
-          <button
-            className="bg-dark dark:bg-light text-light dark:text-dark text-sm px-4 py-2 rounded-md border-2"
-            onClick={() => {
-              void addNumber({ value: Math.floor(Math.random() * 10) })
-            }}
-          >
-            Add a random number
-          </button>
-        </p>
-        <p>
-          Numbers:{' '}
-          {numbers.length === 0 ? 'Click the button!' : numbers.join(', ')}
-        </p>
-        <p>
-          Edit{' '}
-          <code className="text-sm font-bold font-mono bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded-md">
-            convex/myFunctions.ts
-          </code>{' '}
-          to change your backend
-        </p>
-        <p>
-          Edit{' '}
-          <code className="text-sm font-bold font-mono bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded-md">
-            src/routes/index.tsx
-          </code>{' '}
-          to change your frontend
-        </p>
-        <p>
-          Open{' '}
-          <Link
-            to="/anotherPage"
-            className="text-blue-600 underline hover:no-underline"
-          >
-            another page
-          </Link>{' '}
-          to send an action.
-        </p>
-        <div className="flex flex-col">
-          <p className="text-lg font-bold">Useful resources:</p>
-          <div className="flex gap-2">
-            <div className="flex flex-col gap-2 w-1/2">
-              <ResourceCard
-                title="Convex docs"
-                description="Read comprehensive documentation for all Convex features."
-                href="https://docs.convex.dev/home"
-              />
-              <ResourceCard
-                title="Stack articles"
-                description="Learn about best practices, use cases, and more from a growing
-            collection of articles, videos, and walkthroughs."
-                href="https://www.typescriptlang.org/docs/handbook/2/basic-types.html"
-              />
-            </div>
-            <div className="flex flex-col gap-2 w-1/2">
-              <ResourceCard
-                title="Templates"
-                description="Browse our collection of templates to get started quickly."
-                href="https://www.convex.dev/templates"
-              />
-              <ResourceCard
-                title="Discord"
-                description="Join our developer community to ask questions, trade tips & tricks,
-            and show off your projects."
-                href="https://www.convex.dev/community"
-              />
-            </div>
-          </div>
-        </div>
+    <main className="mx-auto max-w-4xl px-4 py-8 sm:px-6">
+      <h1 className="text-2xl font-semibold">Steam Account Size</h1>
+      <p className="mt-2 text-sm text-neutral-600">
+        Public Steam profile URL, SteamID64, or vanity name. Windows install
+        sizes only.
+      </p>
+
+      <form
+        className="mt-6 flex flex-col gap-3 sm:flex-row"
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (!account.trim()) {
+            return
+          }
+          lookupMutation.reset()
+          void lookupMutation.mutateAsync(account.trim())
+        }}
+      >
+        <label className="sr-only" htmlFor="steam-account">
+          Steam account
+        </label>
+        <input
+          id="steam-account"
+          value={account}
+          onChange={(event) => setAccount(event.target.value)}
+          placeholder="https://steamcommunity.com/id/yourname/"
+          className="h-11 flex-1 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900"
+        />
+        <button
+          type="submit"
+          disabled={lookupMutation.isPending || !account.trim()}
+          className="h-11 border border-neutral-900 px-4 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {lookupMutation.isPending ? 'Loading…' : 'Lookup'}
+        </button>
+      </form>
+
+      <div className="mt-4 flex flex-col gap-3 border-t border-neutral-200 pt-4 text-sm text-neutral-700 sm:flex-row sm:items-center sm:justify-between">
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={hideFreeToPlay}
+            onChange={(event) => setHideFreeToPlay(event.target.checked)}
+            className="h-4 w-4"
+          />
+          Hide free-to-play games
+        </label>
+        <input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Filter games"
+          className="h-10 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900 sm:w-64"
+        />
       </div>
+
+      {lookupMutation.error ? (
+        <p className="mt-4 text-sm text-red-700">
+          {lookupMutation.error.message}
+        </p>
+      ) : null}
+
+      {summaryText ? (
+        <p className="mt-6 text-sm text-neutral-700">{summaryText}</p>
+      ) : null}
+
+      {lookupMutation.data ? (
+        <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <label className="flex items-center gap-2 text-sm text-neutral-700">
+            <input
+              type="checkbox"
+              checked={hideFreeToPlay}
+              onChange={(event) => setHideFreeToPlay(event.target.checked)}
+              className="h-4 w-4"
+            />
+            Hide free-to-play
+          </label>
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Filter games"
+            className="h-10 border border-neutral-300 px-3 text-sm outline-none focus:border-neutral-900 sm:w-64"
+          />
+        </div>
+      ) : null}
+
+      <section className="mt-6">
+        <table className="min-w-full border-collapse text-left text-sm">
+          <thead>
+            <tr className="border-b border-neutral-300">
+              <th className="py-2 font-medium">Game</th>
+              <th className="py-2 text-right font-medium">Install size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredGames.length > 0 ? (
+              filteredGames.map((game) => (
+                <tr key={game.appid} className="border-b border-neutral-200">
+                  <td className="py-2 pr-4 text-neutral-950">{game.name}</td>
+                  <td className="py-2 text-right font-mono text-neutral-950">
+                    {game.estimatedSizeHuman}
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={2} className="py-8 text-center text-neutral-500">
+                  {lookupMutation.data
+                    ? 'No games match the current filters.'
+                    : 'Run a lookup to load games.'}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
     </main>
   )
 }
 
-function ResourceCard({
-  title,
-  description,
-  href,
-}: {
-  title: string
-  description: string
-  href: string
-}) {
-  return (
-    <div className="flex flex-col gap-2 bg-slate-200 dark:bg-slate-800 p-4 rounded-md h-28 overflow-auto">
-      <a href={href} className="text-sm underline hover:no-underline">
-        {title}
-      </a>
-      <p className="text-xs">{description}</p>
-    </div>
-  )
+function formatBytes(numBytes: number) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  let value = numBytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  if (unitIndex === 0) {
+    return `${Math.round(value)} ${units[unitIndex]}`
+  }
+  return `${value.toFixed(2)} ${units[unitIndex]}`
 }

@@ -21,7 +21,12 @@ export const Route = createRootRouteWithContext<{
         content: 'width=device-width, initial-scale=1',
       },
       {
-        title: 'TanStack Start Starter',
+        title: 'Steam Account Size',
+      },
+      {
+        name: 'description',
+        content:
+          'Estimate the Windows install size of a public Steam account and browse the per-game breakdown.',
       },
     ],
     links: [
@@ -65,7 +70,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       <head>
         <HeadContent />
       </head>
-      <body>
+      <body className="antialiased">
         {children}
         <Scripts />
       </body>
