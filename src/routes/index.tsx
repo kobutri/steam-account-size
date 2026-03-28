@@ -1,10 +1,23 @@
-import { useDeferredValue, useMemo } from 'react'
+import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useServerFn } from '@tanstack/react-start'
 import { useAction } from 'convex/react'
 import { createFileRoute, stripSearchParams } from '@tanstack/react-router'
 import { api } from '../../convex/_generated/api'
 import type { HomeSearch } from '~/lib/homeSearch'
 import { homeSearchDefaults, validateHomeSearch } from '~/lib/homeSearch'
+import { registerSteamLookupSession } from '~/lib/registerSteamLookupSession'
+import { getOrCreateSessionId } from '~/lib/sessionId'
+
+const SESSION_REFRESH_INTERVAL_MS = 30 * 60 * 1000
+
+type SteamGameRow = {
+  appid: number
+  name: string
+  estimatedSizeBytes: number
+  estimatedSizeHuman: string
+  isFreeToPlay: boolean
+}
 
 export const Route = createFileRoute('/')({
   validateSearch: validateHomeSearch,
@@ -24,19 +37,47 @@ export const Route = createFileRoute('/')({
 function Home() {
   const search = Route.useSearch()
   const lookupAccount = useAction(api.steam.lookupAccount)
+  const registerSession = useServerFn(registerSteamLookupSession)
   const { setAccount, setFilter, setHideFreeToPlay } = useHomeSearchState()
+  const [sessionId, setSessionId] = useState('')
   const deferredSearch = useDeferredValue(search.filter)
+
+  useEffect(() => {
+    setSessionId(getOrCreateSessionId())
+  }, [])
+
+  const sessionQuery = useQuery({
+    queryKey: ['steam-session', sessionId],
+    enabled: sessionId.length > 0,
+    retry: false,
+    staleTime: SESSION_REFRESH_INTERVAL_MS,
+    refetchInterval: SESSION_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: true,
+    queryFn: async () => {
+      return registerSession({
+        data: {
+          sessionId,
+        },
+      })
+    },
+  })
 
   const lookupQuery = useQuery({
     queryKey: ['steam-account', search.account],
-    enabled: search.account.trim().length > 0,
+    enabled:
+      search.account.trim().length > 0 &&
+      sessionId.length > 0 &&
+      sessionQuery.isSuccess,
     queryFn: async () => {
-      return lookupAccount({ account: search.account.trim() })
+      return lookupAccount({
+        account: search.account.trim(),
+        sessionId,
+      })
     },
   })
 
   const visibleBaseGames = useMemo(() => {
-    const games = lookupQuery.data?.games ?? []
+    const games: Array<SteamGameRow> = lookupQuery.data?.games ?? []
     if (!search.hideFreeToPlay) {
       return games
     }
@@ -62,7 +103,7 @@ function Home() {
   }, [visibleBaseGames])
 
   const freeToPlayCount = useMemo(() => {
-    const games = lookupQuery.data?.games ?? []
+    const games: Array<SteamGameRow> = lookupQuery.data?.games ?? []
     return games.filter((game) => game.isFreeToPlay).length
   }, [lookupQuery.data?.games])
 
@@ -133,12 +174,21 @@ function Home() {
         />
         <button
           type="submit"
-          disabled={lookupQuery.isFetching}
+          disabled={
+            lookupQuery.isFetching ||
+            sessionId.length === 0 ||
+            sessionQuery.isPending ||
+            sessionQuery.isError
+          }
           className="h-11 border border-neutral-900 px-4 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {lookupQuery.isFetching ? 'Loading…' : 'Lookup'}
         </button>
       </form>
+
+      {sessionQuery.error ? (
+        <p className="mt-4 text-sm text-red-700">{sessionQuery.error.message}</p>
+      ) : null}
 
       {lookupQuery.error ? (
         <p className="mt-4 text-sm text-red-700">

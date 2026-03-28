@@ -1,6 +1,7 @@
 'use node'
 
 import { ActionCache } from '@convex-dev/action-cache'
+import RateLimiter, { MINUTE } from '@convex-dev/rate-limiter'
 import { v } from 'convex/values'
 import { components, internal } from './_generated/api'
 import { action, internalAction } from './_generated/server'
@@ -114,11 +115,24 @@ const accountResultCache = new ActionCache(components.actionCache, {
   ttl: 1000 * 60 * 60 * 12,
 })
 
+const rateLimiter = new RateLimiter(components.rateLimiter, {
+  steamLookupGlobal: { kind: 'fixed window', rate: 60, period: MINUTE },
+  steamLookupPerIp: {
+    kind: 'token bucket',
+    rate: 12,
+    period: MINUTE,
+    capacity: 4,
+  },
+})
+
 export const lookupAccount = action({
   args: {
     account: v.string(),
+    sessionId: v.string(),
   },
   handler: async (ctx, args): Promise<SteamLookupResult> => {
+    await enforceLookupRateLimit(ctx, args.sessionId)
+
     const steamId = await resolveAccountCache.fetch(ctx, {
       account: args.account,
     })
@@ -133,6 +147,54 @@ export const lookupAccount = action({
     }
   },
 })
+
+async function enforceLookupRateLimit(ctx: ActionCtx, sessionId: string) {
+  const normalizedSessionId = sessionId.trim()
+  if (!normalizedSessionId) {
+    throw new Error('Missing session id.')
+  }
+
+  const sessionLookup = await ctx.runQuery(
+    internal.sessionIp.getIpAddressForSession,
+    {
+      sessionId: normalizedSessionId,
+    },
+  )
+  if (!sessionLookup) {
+    throw new Error('Session is not registered.')
+  }
+
+  const globalStatus = await rateLimiter.limit(ctx, 'steamLookupGlobal')
+  if (!globalStatus.ok) {
+    throw new Error(
+      formatRateLimitMessage(
+        'Too many lookups are happening right now.',
+        globalStatus.retryAfter,
+      ),
+    )
+  }
+
+  const ipStatus = await rateLimiter.limit(ctx, 'steamLookupPerIp', {
+    key: sessionLookup.ipAddress,
+  })
+  if (!ipStatus.ok) {
+    throw new Error(
+      formatRateLimitMessage(
+        'You are making lookups too quickly.',
+        ipStatus.retryAfter,
+      ),
+    )
+  }
+}
+
+function formatRateLimitMessage(prefix: string, retryAfter?: number | null) {
+  if (!retryAfter || retryAfter <= 0) {
+    return prefix
+  }
+
+  const seconds = Math.max(1, Math.ceil(retryAfter / 1000))
+  return `${prefix} Try again in about ${seconds} seconds.`
+}
 
 export const resolveAccountInput = internalAction({
   args: {
@@ -224,10 +286,14 @@ export const computeAccountWindowsSizes = internalAction({
     })
 
     const appInfoMap = new Map<number, SteamCmdApp | null>()
-    await mapWithConcurrency(ownedGames, 12, async (game) => {
+    await mapWithConcurrency(
+      ownedGames,
+      12,
+      async (game: SteamOwnedGame): Promise<void> => {
       const info = await appInfoCache.fetch(ctx, { appid: game.appid })
       appInfoMap.set(game.appid, info)
-    })
+      },
+    )
 
     const totalDepotSizes = new Map<string, number>()
     const games: Array<SteamSizeGame> = []
@@ -261,7 +327,9 @@ export const computeAccountWindowsSizes = internalAction({
       })
     }
 
-    games.sort((left, right) => right.estimatedSizeBytes - left.estimatedSizeBytes)
+    games.sort(
+      (left, right) => right.estimatedSizeBytes - left.estimatedSizeBytes,
+    )
 
     let totalSizeBytes = 0
     for (const depotSize of totalDepotSizes.values()) {
@@ -461,12 +529,7 @@ function parseAccountInput(account: string) {
 }
 
 function getSteamApiKey() {
-  const apiKey =
-    (
-      globalThis as typeof globalThis & {
-        process?: { env?: Record<string, string | undefined> }
-      }
-    ).process?.env?.STEAM_API_KEY ?? null
+  const apiKey = process.env.STEAM_API_KEY ?? null
   if (!apiKey) {
     throw new Error('STEAM_API_KEY is not configured in Convex.')
   }
@@ -488,15 +551,18 @@ async function mapWithConcurrency<T>(
   worker: (value: T) => Promise<void>,
 ) {
   const queue = [...values]
-  const runners = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
-    while (queue.length > 0) {
-      const value = queue.shift()
-      if (!value) {
-        return
+  const runners = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (queue.length > 0) {
+        const value = queue.shift()
+        if (!value) {
+          return
+        }
+        await worker(value)
       }
-      await worker(value)
-    }
-  })
+    },
+  )
   await Promise.all(runners)
 }
 
