@@ -8,7 +8,6 @@
  * @module
  */
 
-import type * as myFunctions from "../myFunctions.js";
 import type * as steam from "../steam.js";
 
 import type {
@@ -18,7 +17,6 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
-  myFunctions: typeof myFunctions;
   steam: typeof steam;
 }>;
 
