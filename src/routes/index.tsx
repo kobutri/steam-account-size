@@ -5,7 +5,7 @@ import { useAction } from 'convex/react'
 import { createFileRoute, stripSearchParams } from '@tanstack/react-router'
 import { api } from '../../convex/_generated/api'
 import type { HomeSearch } from '~/lib/homeSearch'
-import { homeSearchDefaults, validateHomeSearch } from '~/lib/homeSearch'
+import { homeSearchDefaults, homeSearchSchema } from '~/lib/homeSearch'
 import { registerSteamLookupSession } from '~/lib/registerSteamLookupSession'
 import { getOrCreateSessionId } from '~/lib/sessionId'
 
@@ -20,7 +20,7 @@ type SteamGameRow = {
 }
 
 export const Route = createFileRoute('/')({
-  validateSearch: validateHomeSearch,
+  validateSearch: homeSearchSchema,
   search: {
     middlewares: [stripSearchParams(homeSearchDefaults)],
   },
