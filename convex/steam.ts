@@ -162,7 +162,12 @@ async function enforceLookupRateLimit(ctx: ActionCtx, sessionId: string) {
     throw new Error('Session is not registered.')
   }
 
-  const globalStatus = await rateLimiter.limit(ctx, 'steamLookupGlobal')
+  const [globalStatus, ipStatus] = await Promise.all([
+    rateLimiter.limit(ctx, 'steamLookupGlobal'),
+    rateLimiter.limit(ctx, 'steamLookupPerIp', {
+      key: sessionLookup.ipAddress,
+    }),
+  ])
   if (!globalStatus.ok) {
     throw new Error(
       formatRateLimitMessage(
@@ -172,9 +177,6 @@ async function enforceLookupRateLimit(ctx: ActionCtx, sessionId: string) {
     )
   }
 
-  const ipStatus = await rateLimiter.limit(ctx, 'steamLookupPerIp', {
-    key: sessionLookup.ipAddress,
-  })
   if (!ipStatus.ok) {
     throw new Error(
       formatRateLimitMessage(
