@@ -1,4 +1,5 @@
 import {
+  bigint,
   boolean,
   integer,
   pgTable,
@@ -39,7 +40,7 @@ export const steamApps = pgTable('steam_apps', {
   name: text('name'),
   type: text('type'),
   isFreeToPlay: boolean('is_free_to_play').notNull().default(false),
-  windowsSizeBytes: integer('windows_size_bytes'),
+  windowsSizeBytes: bigint('windows_size_bytes', { mode: 'number' }),
   hasSize: boolean('has_size').notNull().default(false),
   updatedAt,
 })
