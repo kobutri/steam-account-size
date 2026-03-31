@@ -1,6 +1,5 @@
 export type SteamOwnedGame = {
   appid: number
-  name: string
 }
 
 export type SteamCmdDepot = {

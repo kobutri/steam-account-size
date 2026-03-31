@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, inArray, notInArray, sql } from 'drizzle-orm'
 import type {
   SteamCmdApp,
   SteamCmdDepot,
@@ -9,10 +9,10 @@ import type {
 import { formatBytes } from '~/lib/formatBytes'
 import { getDb } from '~/lib/server/db'
 import {
-  steamAccountResolutionCache,
-  steamAccountResultCache,
-  steamAppInfoCache,
-  steamOwnedGamesCache,
+  steamAccountResolutions,
+  steamApps,
+  steamOwnedGameSyncs,
+  steamOwnedGames,
 } from '~/lib/server/db/schema'
 
 const WINDOWS_PLATFORM = 'windows'
@@ -23,7 +23,6 @@ const STEAMCMD_INFO_BASE = 'https://api.steamcmd.net/v1/info'
 const ACCOUNT_RESOLUTION_TTL_MS = 1000 * 60 * 60 * 24 * 30
 const OWNED_GAMES_TTL_MS = 1000 * 60 * 60 * 12
 const APP_INFO_TTL_MS = 1000 * 60 * 60 * 24 * 7
-const ACCOUNT_RESULT_TTL_MS = 1000 * 60 * 60 * 12
 
 const EXCLUDED_EXACT_NAMES = new Set([
   '3DMark',
@@ -47,16 +46,75 @@ const EXCLUDED_TYPES = new Set([
   'video',
 ])
 
+type SteamAppRecord = {
+  appid: number
+  name: string | null
+  type: string | null
+  isFreeToPlay: boolean
+  windowsSizeBytes: number | null
+  hasSize: boolean
+}
+
 export async function lookupSteamAccountByInput(
   account: string,
 ): Promise<SteamLookupResult> {
   const normalizedAccount = account.trim()
   const steamId = await resolveAccountInput(normalizedAccount)
-  const result = await computeAccountWindowsSizes(steamId)
+  const ownedGames = await getOwnedGamesForAccount(steamId)
+  const apps = await getSteamApps(ownedGames)
+
+  const totalDepotSizes = new Map<number, number>()
+  const games: Array<SteamSizeGame> = []
+  let missingGames = 0
+
+  for (const ownedGame of ownedGames) {
+    const app = apps.get(ownedGame.appid)
+    if (!app) {
+      continue
+    }
+    if (!app.name) {
+      missingGames += 1
+      continue
+    }
+    if (!isRealGame(app.name, app.type)) {
+      continue
+    }
+
+    const windowsSizeBytes = app.windowsSizeBytes ?? 0
+    if (!app.hasSize || windowsSizeBytes <= 0) {
+      missingGames += 1
+      continue
+    }
+
+    totalDepotSizes.set(ownedGame.appid, windowsSizeBytes)
+    games.push({
+      appid: ownedGame.appid,
+      name: app.name,
+      estimatedSizeBytes: windowsSizeBytes,
+      estimatedSizeHuman: formatBytes(windowsSizeBytes),
+      isFreeToPlay: app.isFreeToPlay,
+      type: app.type,
+    })
+  }
+
+  games.sort(
+    (left, right) => right.estimatedSizeBytes - left.estimatedSizeBytes,
+  )
+
+  let totalSizeBytes = 0
+  for (const depotSize of totalDepotSizes.values()) {
+    totalSizeBytes += depotSize
+  }
 
   return {
-    ...result,
     account: normalizedAccount,
+    steamId,
+    totalSizeBytes,
+    totalSizeHuman: formatBytes(totalSizeBytes),
+    countedGames: games.length,
+    missingGames,
+    platform: WINDOWS_PLATFORM,
+    games,
   }
 }
 
@@ -70,11 +128,11 @@ async function resolveAccountInput(account: string): Promise<string> {
   const db = getDb()
   const cachedRows = await db
     .select({
-      steamId: steamAccountResolutionCache.steamId,
-      updatedAt: steamAccountResolutionCache.updatedAt,
+      steamId: steamAccountResolutions.steamId,
+      updatedAt: steamAccountResolutions.updatedAt,
     })
-    .from(steamAccountResolutionCache)
-    .where(eq(steamAccountResolutionCache.cacheKey, cacheKey))
+    .from(steamAccountResolutions)
+    .where(eq(steamAccountResolutions.cacheKey, cacheKey))
     .limit(1)
   const cached = cachedRows.at(0)
 
@@ -97,13 +155,13 @@ async function resolveAccountInput(account: string): Promise<string> {
   }
 
   await db
-    .insert(steamAccountResolutionCache)
+    .insert(steamAccountResolutions)
     .values({
       cacheKey,
       steamId,
     })
     .onConflictDoUpdate({
-      target: steamAccountResolutionCache.cacheKey,
+      target: steamAccountResolutions.cacheKey,
       set: {
         steamId,
         updatedAt: sql`NOW()`,
@@ -113,22 +171,36 @@ async function resolveAccountInput(account: string): Promise<string> {
   return steamId
 }
 
-async function fetchOwnedGames(steamId: string): Promise<Array<SteamOwnedGame>> {
+async function getOwnedGamesForAccount(
+  steamId: string,
+): Promise<Array<SteamOwnedGame>> {
   const db = getDb()
-  const cachedRows = await db
+  const syncRows = await db
     .select({
-      payload: steamOwnedGamesCache.payload,
-      updatedAt: steamOwnedGamesCache.updatedAt,
+      updatedAt: steamOwnedGameSyncs.updatedAt,
     })
-    .from(steamOwnedGamesCache)
-    .where(eq(steamOwnedGamesCache.steamId, steamId))
+    .from(steamOwnedGameSyncs)
+    .where(eq(steamOwnedGameSyncs.steamId, steamId))
     .limit(1)
-  const cached = cachedRows.at(0)
+  const sync = syncRows.at(0)
 
-  if (cached !== undefined && !isExpired(cached.updatedAt, OWNED_GAMES_TTL_MS)) {
-    return cached.payload
+  if (sync === undefined || isExpired(sync.updatedAt, OWNED_GAMES_TTL_MS)) {
+    return refreshOwnedGamesForAccount(steamId)
   }
 
+    const rows = await db
+    .select({
+      appid: steamOwnedGames.appid,
+    })
+    .from(steamOwnedGames)
+    .where(eq(steamOwnedGames.steamId, steamId))
+
+  return rows
+}
+
+async function refreshOwnedGamesForAccount(
+  steamId: string,
+): Promise<Array<SteamOwnedGame>> {
   const apiKey = getSteamApiKey()
   const url = new URL(`${STEAM_API_BASE}/IPlayerService/GetOwnedGames/v1/`)
   url.searchParams.set('key', apiKey)
@@ -152,19 +224,44 @@ async function fetchOwnedGames(steamId: string): Promise<Array<SteamOwnedGame>> 
 
   const normalized = games.map((game) => ({
     appid: game.appid,
-    name: game.name?.trim() || `App ${game.appid}`,
   }))
 
+  const db = getDb()
+  const currentAppIds = normalized.map((game) => game.appid)
+
+  if (currentAppIds.length > 0) {
+    await db
+      .delete(steamOwnedGames)
+      .where(
+        and(
+          eq(steamOwnedGames.steamId, steamId),
+          notInArray(steamOwnedGames.appid, currentAppIds),
+        ),
+      )
+  } else {
+    await db.delete(steamOwnedGames).where(eq(steamOwnedGames.steamId, steamId))
+  }
+
+  if (normalized.length > 0) {
+    await db
+      .insert(steamOwnedGames)
+      .values(
+        normalized.map((game) => ({
+          steamId,
+          appid: game.appid,
+        })),
+      )
+      .onConflictDoNothing()
+  }
+
   await db
-    .insert(steamOwnedGamesCache)
+    .insert(steamOwnedGameSyncs)
     .values({
       steamId,
-      payload: normalized,
     })
     .onConflictDoUpdate({
-      target: steamOwnedGamesCache.steamId,
+      target: steamOwnedGameSyncs.steamId,
       set: {
-        payload: normalized,
         updatedAt: sql`NOW()`,
       },
     })
@@ -172,173 +269,155 @@ async function fetchOwnedGames(steamId: string): Promise<Array<SteamOwnedGame>> 
   return normalized
 }
 
-async function fetchAppInfo(appid: number): Promise<SteamCmdApp | null> {
-  const db = getDb()
-  const cachedRows = await db
-    .select({
-      payload: steamAppInfoCache.payload,
-      updatedAt: steamAppInfoCache.updatedAt,
-    })
-    .from(steamAppInfoCache)
-    .where(eq(steamAppInfoCache.appid, appid))
-    .limit(1)
-  const cached = cachedRows.at(0)
-
-  if (cached !== undefined && !isExpired(cached.updatedAt, APP_INFO_TTL_MS)) {
-    return cached.payload
+async function getSteamApps(ownedGames: Array<SteamOwnedGame>) {
+  const appIds = Array.from(new Set(ownedGames.map((game) => game.appid)))
+  if (appIds.length === 0) {
+    return new Map<number, SteamAppRecord>()
   }
 
+  const db = getDb()
+  const existingRows = await db
+    .select({
+      appid: steamApps.appid,
+      name: steamApps.name,
+      type: steamApps.type,
+      isFreeToPlay: steamApps.isFreeToPlay,
+      windowsSizeBytes: steamApps.windowsSizeBytes,
+      hasSize: steamApps.hasSize,
+      updatedAt: steamApps.updatedAt,
+    })
+    .from(steamApps)
+    .where(inArray(steamApps.appid, appIds))
+
+  const staleOrMissing = appIds.filter((appid) => {
+    const row = existingRows.find((entry) => entry.appid === appid)
+    return row === undefined || isExpired(row.updatedAt, APP_INFO_TTL_MS)
+  })
+
+  if (staleOrMissing.length > 0) {
+    const refreshedRows = await refreshSteamApps(staleOrMissing)
+    for (const refreshed of refreshedRows) {
+      const existingIndex = existingRows.findIndex(
+        (entry) => entry.appid === refreshed.appid,
+      )
+      if (existingIndex >= 0) {
+        existingRows[existingIndex] = refreshed
+      } else {
+        existingRows.push(refreshed)
+      }
+    }
+  }
+
+  return new Map<number, SteamAppRecord>(
+    existingRows.map((row) => [
+      row.appid,
+      {
+        appid: row.appid,
+        name: row.name,
+        type: row.type,
+        isFreeToPlay: row.isFreeToPlay,
+        windowsSizeBytes: row.windowsSizeBytes,
+        hasSize: row.hasSize,
+      },
+    ]),
+  )
+}
+
+async function refreshSteamApps(
+  appIds: Array<number>,
+) {
+  const appInfoMap = new Map<number, SteamCmdApp | null>()
+
+  await mapWithConcurrency(appIds, 12, async (appid) => {
+    const info = await fetchAppInfo(appid)
+    appInfoMap.set(appid, info)
+  })
+
+  const rows = appIds.map((appid) => {
+    const appInfo = appInfoMap.get(appid) ?? null
+    const name = normalizeName(appInfo?.common?.name)
+    const type = normalizeType(appInfo?.common?.type)
+    const windowsSizeBytes = estimateWindowsSizeFromAppInfo(appInfo)
+
+    return {
+      appid,
+      name,
+      type,
+      isFreeToPlay: isFreeToPlay(appInfo),
+      windowsSizeBytes,
+      hasSize: windowsSizeBytes > 0,
+      updatedAt: new Date(),
+    }
+  })
+
+  const db = getDb()
+  await db
+    .insert(steamApps)
+    .values(
+      rows.map((row) => ({
+        appid: row.appid,
+        name: row.name,
+        type: row.type,
+        isFreeToPlay: row.isFreeToPlay,
+        windowsSizeBytes: row.windowsSizeBytes > 0 ? row.windowsSizeBytes : null,
+        hasSize: row.hasSize,
+      })),
+    )
+    .onConflictDoUpdate({
+      target: steamApps.appid,
+      set: {
+        name: sql`excluded.name`,
+        type: sql`excluded.type`,
+        isFreeToPlay: sql`excluded.is_free_to_play`,
+        windowsSizeBytes: sql`excluded.windows_size_bytes`,
+        hasSize: sql`excluded.has_size`,
+        updatedAt: sql`NOW()`,
+      },
+    })
+
+  const persistedRows = await db
+    .select({
+      appid: steamApps.appid,
+      name: steamApps.name,
+      type: steamApps.type,
+      isFreeToPlay: steamApps.isFreeToPlay,
+      windowsSizeBytes: steamApps.windowsSizeBytes,
+      hasSize: steamApps.hasSize,
+      updatedAt: steamApps.updatedAt,
+    })
+    .from(steamApps)
+    .where(inArray(steamApps.appid, appIds))
+
+  return persistedRows
+}
+
+async function fetchAppInfo(appid: number): Promise<SteamCmdApp | null> {
   const payload = await fetchJson<{
     data?: Record<string, SteamCmdApp | string>
     status?: string
   }>(`${STEAMCMD_INFO_BASE}/${appid}`)
 
   const data = payload.data?.[String(appid)]
-  const value = !data || typeof data === 'string' ? null : data
-
-  await db
-    .insert(steamAppInfoCache)
-    .values({
-      appid,
-      payload: value,
-    })
-    .onConflictDoUpdate({
-      target: steamAppInfoCache.appid,
-      set: {
-        payload: value,
-        updatedAt: sql`NOW()`,
-      },
-    })
-
-  return value
+  return !data || typeof data === 'string' ? null : data
 }
 
-async function computeAccountWindowsSizes(
-  steamId: string,
-): Promise<SteamLookupResult> {
-  const db = getDb()
-  const cachedRows = await db
-    .select({
-      payload: steamAccountResultCache.payload,
-      updatedAt: steamAccountResultCache.updatedAt,
-    })
-    .from(steamAccountResultCache)
-    .where(eq(steamAccountResultCache.steamId, steamId))
-    .limit(1)
-  const cached = cachedRows.at(0)
-
-  if (cached !== undefined && !isExpired(cached.updatedAt, ACCOUNT_RESULT_TTL_MS)) {
-    return {
-      ...cached.payload,
-      account: '',
-    }
-  }
-
-  const ownedGames = await fetchOwnedGames(steamId)
-  const appInfoMap = new Map<number, SteamCmdApp | null>()
-
-  await mapWithConcurrency(ownedGames, 12, async (game) => {
-    const info = await fetchAppInfo(game.appid)
-    appInfoMap.set(game.appid, info)
-  })
-
-  const totalDepotSizes = new Map<string, number>()
-  const games: Array<SteamSizeGame> = []
-  let missingGames = 0
-
-  for (const ownedGame of ownedGames) {
-    const appInfo = appInfoMap.get(ownedGame.appid) ?? null
-    if (!isRealGame(appInfo, ownedGame.name)) {
-      continue
-    }
-
-    const size = await estimateWindowsSize(appInfoMap, ownedGame.appid)
-    if (size.perGameBytes <= 0) {
-      missingGames += 1
-      continue
-    }
-
-    for (const depot of size.globalDepots) {
-      if (!totalDepotSizes.has(depot.depotId)) {
-        totalDepotSizes.set(depot.depotId, depot.sizeBytes)
-      }
-    }
-
-    games.push({
-      appid: ownedGame.appid,
-      name: getDisplayName(appInfo, ownedGame.name),
-      estimatedSizeBytes: size.perGameBytes,
-      estimatedSizeHuman: formatBytes(size.perGameBytes),
-      isFreeToPlay: isFreeToPlay(appInfo),
-      type: normalizeType(appInfo?.common?.type),
-    })
-  }
-
-  games.sort(
-    (left, right) => right.estimatedSizeBytes - left.estimatedSizeBytes,
-  )
-
-  let totalSizeBytes = 0
-  for (const depotSize of totalDepotSizes.values()) {
-    totalSizeBytes += depotSize
-  }
-
-  const result: Omit<SteamLookupResult, 'account'> = {
-    steamId,
-    totalSizeBytes,
-    totalSizeHuman: formatBytes(totalSizeBytes),
-    countedGames: games.length,
-    missingGames,
-    platform: WINDOWS_PLATFORM,
-    games,
-  }
-
-  await db
-    .insert(steamAccountResultCache)
-    .values({
-      steamId,
-      payload: result,
-    })
-    .onConflictDoUpdate({
-      target: steamAccountResultCache.steamId,
-      set: {
-        payload: result,
-        updatedAt: sql`NOW()`,
-      },
-    })
-
-  return {
-    ...result,
-    account: '',
-  }
-}
-
-async function estimateWindowsSize(
-  appInfoMap: Map<number, SteamCmdApp | null>,
-  appid: number,
-) {
-  const appInfo = await getAppInfo(appInfoMap, appid)
+function estimateWindowsSizeFromAppInfo(appInfo: SteamCmdApp | null) {
   const depots = numericDepots(appInfo)
   const perGameDepotIds = new Set<string>()
-  const globalDepotSizes: Array<{ depotId: string; sizeBytes: number }> = []
   let perGameBytes = 0
 
   for (const [depotId, depot] of depots) {
-    const resolvedDepot = await resolveDepot(appInfoMap, depotId, depot)
-    if (!resolvedDepot) {
+    if (!matchesPlatform(depot, WINDOWS_PLATFORM)) {
       continue
     }
-    if (!matchesPlatform(resolvedDepot, WINDOWS_PLATFORM)) {
+    if (!matchesLanguage(depot, DEFAULT_LANGUAGE)) {
       continue
     }
-    if (!matchesLanguage(resolvedDepot, DEFAULT_LANGUAGE)) {
-      continue
-    }
-    if (isOptionalDepot(resolvedDepot)) {
+    if (isOptionalDepot(depot)) {
       continue
     }
 
-    const sizeBytes = selectDepotSize(resolvedDepot)
+    const sizeBytes = selectDepotSize(depot)
     if (sizeBytes <= 0) {
       continue
     }
@@ -347,41 +426,9 @@ async function estimateWindowsSize(
       perGameDepotIds.add(depotId)
       perGameBytes += sizeBytes
     }
-    globalDepotSizes.push({ depotId, sizeBytes })
   }
 
-  return { perGameBytes, globalDepots: globalDepotSizes }
-}
-
-async function resolveDepot(
-  appInfoMap: Map<number, SteamCmdApp | null>,
-  depotId: string,
-  depot: SteamCmdDepot,
-) {
-  if (selectDepotSize(depot) > 0) {
-    return depot
-  }
-
-  const sourceApp = parseNumber(depot.depotfromapp)
-  if (!sourceApp) {
-    return depot
-  }
-
-  const sourceInfo = await getAppInfo(appInfoMap, sourceApp)
-  const sourceDepot = sourceInfo?.depots?.[depotId]
-  return sourceDepot && typeof sourceDepot === 'object' ? sourceDepot : null
-}
-
-async function getAppInfo(
-  appInfoMap: Map<number, SteamCmdApp | null>,
-  appid: number,
-) {
-  if (!appInfoMap.has(appid)) {
-    const info = await fetchAppInfo(appid)
-    appInfoMap.set(appid, info)
-  }
-
-  return appInfoMap.get(appid) ?? null
+  return perGameBytes
 }
 
 function numericDepots(appInfo: SteamCmdApp | null) {
@@ -395,10 +442,8 @@ function numericDepots(appInfo: SteamCmdApp | null) {
   )
 }
 
-function isRealGame(appInfo: SteamCmdApp | null, fallbackName: string) {
-  const name = getDisplayName(appInfo, fallbackName)
+function isRealGame(name: string, type: string | null) {
   const normalizedName = name.toLowerCase()
-  const type = normalizeType(appInfo?.common?.type)
 
   if (EXCLUDED_EXACT_NAMES.has(name)) {
     return false
@@ -454,12 +499,13 @@ function splitList(value: string | undefined) {
     : []
 }
 
-function getDisplayName(appInfo: SteamCmdApp | null, fallbackName: string) {
-  return appInfo?.common?.name?.trim() || fallbackName
-}
-
 function normalizeType(type: string | undefined) {
   return type?.trim().toLowerCase() || null
+}
+
+function normalizeName(name: string | undefined) {
+  const trimmed = name?.trim()
+  return trimmed ? trimmed : null
 }
 
 function parseAccountInput(account: string) {

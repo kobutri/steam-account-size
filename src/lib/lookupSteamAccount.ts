@@ -9,13 +9,13 @@ export const lookupSteamAccount = createServerFn({ method: 'POST' })
     }
 
     const request = (options as typeof options & { request: Request }).request
-    const [{ unstable_checkRateLimit }, { lookupSteamAccountByInput }] =
+    const [{ checkRateLimit }, { lookupSteamAccountByInput }] =
       await Promise.all([
         import('@vercel/firewall'),
         import('~/lib/server/steamLookup'),
       ])
 
-    const rateLimit = await unstable_checkRateLimit('steam-account-lookup', {
+    const rateLimit = await checkRateLimit('steam-account-lookup', {
       request,
       ...(process.env.NODE_ENV === 'production'
         ? {}

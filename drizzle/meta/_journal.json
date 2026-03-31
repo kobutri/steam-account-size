@@ -8,6 +8,20 @@
       "when": 1774994489431,
       "tag": "0000_brown_xorn",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1774997036378,
+      "tag": "0001_normalized_steam_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1775000700000,
+      "tag": "0002_drop_owned_game_name",
+      "breakpoints": true
     }
   ]
 }

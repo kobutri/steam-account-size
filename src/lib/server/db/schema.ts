@@ -1,16 +1,11 @@
 import {
+  boolean,
   integer,
-  jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
 } from 'drizzle-orm/pg-core'
-import type {
-  SteamCmdApp,
-  SteamLookupResult,
-  SteamOwnedGame,
-  SteamSizeGame,
-} from '~/lib/server/steamTypes'
 
 const updatedAt = timestamp('updated_at', {
   withTimezone: true,
@@ -19,31 +14,32 @@ const updatedAt = timestamp('updated_at', {
   .notNull()
   .defaultNow()
 
-export const steamAccountResolutionCache = pgTable(
-  'steam_account_resolution_cache',
+export const steamAccountResolutions = pgTable('steam_account_resolutions', {
+  cacheKey: text('cache_key').primaryKey(),
+  steamId: text('steam_id').notNull(),
+  updatedAt,
+})
+
+export const steamOwnedGameSyncs = pgTable('steam_owned_game_syncs', {
+  steamId: text('steam_id').primaryKey(),
+  updatedAt,
+})
+
+export const steamOwnedGames = pgTable(
+  'steam_owned_games',
   {
-    cacheKey: text('cache_key').primaryKey(),
     steamId: text('steam_id').notNull(),
-    updatedAt,
+    appid: integer('appid').notNull(),
   },
+  (table) => [primaryKey({ columns: [table.steamId, table.appid] })],
 )
 
-export const steamOwnedGamesCache = pgTable('steam_owned_games_cache', {
-  steamId: text('steam_id').primaryKey(),
-  payload: jsonb('payload').$type<Array<SteamOwnedGame>>().notNull(),
-  updatedAt,
-})
-
-export const steamAppInfoCache = pgTable('steam_app_info_cache', {
+export const steamApps = pgTable('steam_apps', {
   appid: integer('appid').primaryKey(),
-  payload: jsonb('payload').$type<SteamCmdApp | null>(),
+  name: text('name'),
+  type: text('type'),
+  isFreeToPlay: boolean('is_free_to_play').notNull().default(false),
+  windowsSizeBytes: integer('windows_size_bytes'),
+  hasSize: boolean('has_size').notNull().default(false),
   updatedAt,
 })
-
-export const steamAccountResultCache = pgTable('steam_account_result_cache', {
-  steamId: text('steam_id').primaryKey(),
-  payload: jsonb('payload').$type<Omit<SteamLookupResult, 'account'>>().notNull(),
-  updatedAt,
-})
-
-export type SteamGameCacheRow = SteamSizeGame
