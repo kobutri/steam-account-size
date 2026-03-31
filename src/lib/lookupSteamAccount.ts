@@ -14,22 +14,20 @@ export const lookupSteamAccount = createServerFn({ method: 'POST' })
         import('@vercel/firewall'),
         import('~/lib/server/steamLookup'),
       ])
+    if (process.env.NODE_ENV === 'production') {
+      const rateLimit = await checkRateLimit('steam-account-lookup', {
+        request,
+      })
 
-    const rateLimit = await checkRateLimit('steam-account-lookup', {
-      request,
-      ...(process.env.NODE_ENV === 'production'
-        ? {}
-        : { firewallHostForDevelopment: 'ignore-for-testing' as const }),
-    })
+      if (rateLimit.error === 'not-found') {
+        throw new Error(
+          'Missing Vercel Firewall rate limit rule: steam-account-lookup.',
+        )
+      }
 
-    if (process.env.NODE_ENV === 'production' && rateLimit.error === 'not-found') {
-      throw new Error(
-        'Missing Vercel Firewall rate limit rule: steam-account-lookup.',
-      )
-    }
-
-    if (rateLimit.rateLimited) {
-      throw new Error('Too many lookups. Try again shortly.')
+      if (rateLimit.rateLimited) {
+        throw new Error('Too many lookups. Try again shortly.')
+      }
     }
 
     return lookupSteamAccountByInput(account)

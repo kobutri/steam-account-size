@@ -55,13 +55,18 @@ type SteamAppRecord = {
   hasSize: boolean
 }
 
+type OwnedGamesWithAppsSnapshot = {
+  ownedGames: Array<SteamOwnedGame>
+  apps: Map<number, SteamAppRecord>
+}
+
 export async function lookupSteamAccountByInput(
   account: string,
 ): Promise<SteamLookupResult> {
   const normalizedAccount = account.trim()
-  const steamId = await resolveAccountInput(normalizedAccount)
-  const ownedGames = await getOwnedGamesForAccount(steamId)
-  const apps = await getSteamApps(ownedGames)
+  const parsed = parseAccountInput(normalizedAccount)
+  const snapshot = await loadLookupSnapshot(parsed)
+  const { steamId, ownedGames, apps } = snapshot
 
   const totalDepotSizes = new Map<number, number>()
   const games: Array<SteamSizeGame> = []
@@ -113,13 +118,131 @@ export async function lookupSteamAccountByInput(
     totalSizeHuman: formatBytes(totalSizeBytes),
     countedGames: games.length,
     missingGames,
-    platform: WINDOWS_PLATFORM,
+    platform: WINDOWS_PLATFORM as 'windows',
     games,
   }
 }
 
-async function resolveAccountInput(account: string): Promise<string> {
-  const parsed = parseAccountInput(account)
+async function loadLookupSnapshot(
+  parsed: ReturnType<typeof parseAccountInput>,
+): Promise<OwnedGamesWithAppsSnapshot & { steamId: string }> {
+  if (parsed.kind === 'steamId') {
+    const snapshot = await getOwnedGamesAndApps(parsed.value)
+    return {
+      steamId: parsed.value,
+      ...snapshot,
+    }
+  }
+
+  const cached = await loadCachedVanityLookup(parsed.value)
+  if (cached) {
+    return cached
+  }
+
+  const steamId = await resolveAccountInput(parsed.value, parsed)
+  const snapshot = await getOwnedGamesAndApps(steamId)
+  return {
+    steamId,
+    ...snapshot,
+  }
+}
+
+async function loadCachedVanityLookup(
+  vanity: string,
+): Promise<(OwnedGamesWithAppsSnapshot & { steamId: string }) | null> {
+  const cacheKey = `vanity:${vanity.toLowerCase()}`
+  const db = getDb()
+  const joinedRows = await db
+    .select({
+      steamId: steamAccountResolutions.steamId,
+      resolutionUpdatedAt: steamAccountResolutions.updatedAt,
+      syncUpdatedAt: steamOwnedGameSyncs.updatedAt,
+      appid: steamOwnedGames.appid,
+      name: steamApps.name,
+      type: steamApps.type,
+      isFreeToPlay: steamApps.isFreeToPlay,
+      windowsSizeBytes: steamApps.windowsSizeBytes,
+      hasSize: steamApps.hasSize,
+      appUpdatedAt: steamApps.updatedAt,
+    })
+    .from(steamAccountResolutions)
+    .leftJoin(
+      steamOwnedGameSyncs,
+      eq(steamOwnedGameSyncs.steamId, steamAccountResolutions.steamId),
+    )
+    .leftJoin(
+      steamOwnedGames,
+      eq(steamOwnedGames.steamId, steamAccountResolutions.steamId),
+    )
+    .leftJoin(steamApps, eq(steamApps.appid, steamOwnedGames.appid))
+    .where(eq(steamAccountResolutions.cacheKey, cacheKey))
+
+  const firstRow = joinedRows.at(0)
+  if (!firstRow) {
+    return null
+  }
+
+  if (isExpired(firstRow.resolutionUpdatedAt, ACCOUNT_RESOLUTION_TTL_MS)) {
+    return null
+  }
+
+  if (!firstRow.syncUpdatedAt || isExpired(firstRow.syncUpdatedAt, OWNED_GAMES_TTL_MS)) {
+    return null
+  }
+
+  const ownedGames: Array<SteamOwnedGame> = []
+  const apps = new Map<number, SteamAppRecord>()
+  const staleOrMissingAppIds: Array<number> = []
+
+  for (const row of joinedRows) {
+    if (row.appid === null) {
+      continue
+    }
+
+    ownedGames.push({ appid: row.appid })
+
+    if (row.appUpdatedAt === null || isExpired(row.appUpdatedAt, APP_INFO_TTL_MS)) {
+      staleOrMissingAppIds.push(row.appid)
+      continue
+    }
+
+    apps.set(row.appid, {
+      appid: row.appid,
+      name: row.name,
+      type: row.type,
+      isFreeToPlay: row.isFreeToPlay ?? false,
+      windowsSizeBytes: row.windowsSizeBytes,
+      hasSize: row.hasSize ?? false,
+    })
+  }
+
+  if (staleOrMissingAppIds.length > 0) {
+    const refreshedRows = await refreshSteamApps(staleOrMissingAppIds)
+
+    for (const row of refreshedRows) {
+      apps.set(row.appid, {
+        appid: row.appid,
+        name: row.name,
+        type: row.type,
+        isFreeToPlay: row.isFreeToPlay,
+        windowsSizeBytes: row.windowsSizeBytes,
+        hasSize: row.hasSize,
+      })
+    }
+  }
+
+  return {
+    steamId: firstRow.steamId,
+    ownedGames,
+    apps,
+  }
+}
+
+async function resolveAccountInput(
+  account: string,
+  parsedInput?: ReturnType<typeof parseAccountInput>,
+): Promise<string> {
+  const parsed = parsedInput ?? parseAccountInput(account)
   if (parsed.kind === 'steamId') {
     return parsed.value
   }
@@ -171,31 +294,78 @@ async function resolveAccountInput(account: string): Promise<string> {
   return steamId
 }
 
-async function getOwnedGamesForAccount(
+async function getOwnedGamesAndApps(
   steamId: string,
-): Promise<Array<SteamOwnedGame>> {
+): Promise<OwnedGamesWithAppsSnapshot> {
   const db = getDb()
-  const syncRows = await db
+  const joinedRows = await db
     .select({
-      updatedAt: steamOwnedGameSyncs.updatedAt,
+      syncUpdatedAt: steamOwnedGameSyncs.updatedAt,
+      appid: steamOwnedGames.appid,
+      name: steamApps.name,
+      type: steamApps.type,
+      isFreeToPlay: steamApps.isFreeToPlay,
+      windowsSizeBytes: steamApps.windowsSizeBytes,
+      hasSize: steamApps.hasSize,
+      appUpdatedAt: steamApps.updatedAt,
     })
     .from(steamOwnedGameSyncs)
+    .leftJoin(
+      steamOwnedGames,
+      eq(steamOwnedGames.steamId, steamOwnedGameSyncs.steamId),
+    )
+    .leftJoin(steamApps, eq(steamApps.appid, steamOwnedGames.appid))
     .where(eq(steamOwnedGameSyncs.steamId, steamId))
-    .limit(1)
-  const sync = syncRows.at(0)
 
-  if (sync === undefined || isExpired(sync.updatedAt, OWNED_GAMES_TTL_MS)) {
-    return refreshOwnedGamesForAccount(steamId)
+  const syncUpdatedAt = joinedRows.at(0)?.syncUpdatedAt
+  if (!syncUpdatedAt || isExpired(syncUpdatedAt, OWNED_GAMES_TTL_MS)) {
+    const ownedGames = await refreshOwnedGamesForAccount(steamId)
+    const apps = await getSteamApps(ownedGames)
+    return { ownedGames, apps }
   }
 
-    const rows = await db
-    .select({
-      appid: steamOwnedGames.appid,
-    })
-    .from(steamOwnedGames)
-    .where(eq(steamOwnedGames.steamId, steamId))
+  const ownedGames: Array<SteamOwnedGame> = []
+  const apps = new Map<number, SteamAppRecord>()
+  const staleOrMissingAppIds: Array<number> = []
 
-  return rows
+  for (const row of joinedRows) {
+    if (row.appid === null) {
+      continue
+    }
+
+    ownedGames.push({ appid: row.appid })
+
+    if (row.appUpdatedAt === null || isExpired(row.appUpdatedAt, APP_INFO_TTL_MS)) {
+      staleOrMissingAppIds.push(row.appid)
+      continue
+    }
+
+    apps.set(row.appid, {
+      appid: row.appid,
+      name: row.name,
+      type: row.type,
+      isFreeToPlay: row.isFreeToPlay ?? false,
+      windowsSizeBytes: row.windowsSizeBytes,
+      hasSize: row.hasSize ?? false,
+    })
+  }
+
+  if (staleOrMissingAppIds.length > 0) {
+    const refreshedRows = await refreshSteamApps(staleOrMissingAppIds)
+
+    for (const row of refreshedRows) {
+      apps.set(row.appid, {
+        appid: row.appid,
+        name: row.name,
+        type: row.type,
+        isFreeToPlay: row.isFreeToPlay,
+        windowsSizeBytes: row.windowsSizeBytes,
+        hasSize: row.hasSize,
+      })
+    }
+  }
+
+  return { ownedGames, apps }
 }
 
 async function refreshOwnedGamesForAccount(
@@ -269,7 +439,9 @@ async function refreshOwnedGamesForAccount(
   return normalized
 }
 
-async function getSteamApps(ownedGames: Array<SteamOwnedGame>) {
+async function getSteamApps(
+  ownedGames: Array<SteamOwnedGame>,
+) {
   const appIds = Array.from(new Set(ownedGames.map((game) => game.appid)))
   if (appIds.length === 0) {
     return new Map<number, SteamAppRecord>()
@@ -289,11 +461,12 @@ async function getSteamApps(ownedGames: Array<SteamOwnedGame>) {
     .from(steamApps)
     .where(inArray(steamApps.appid, appIds))
 
+  const existingRowsByAppId = new Map(existingRows.map((row) => [row.appid, row]))
+
   const staleOrMissing = appIds.filter((appid) => {
-    const row = existingRows.find((entry) => entry.appid === appid)
+    const row = existingRowsByAppId.get(appid)
     return row === undefined || isExpired(row.updatedAt, APP_INFO_TTL_MS)
   })
-
   if (staleOrMissing.length > 0) {
     const refreshedRows = await refreshSteamApps(staleOrMissing)
     for (const refreshed of refreshedRows) {
@@ -305,6 +478,7 @@ async function getSteamApps(ownedGames: Array<SteamOwnedGame>) {
       } else {
         existingRows.push(refreshed)
       }
+      existingRowsByAppId.set(refreshed.appid, refreshed)
     }
   }
 
