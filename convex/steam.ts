@@ -1,5 +1,3 @@
-'use node'
-
 import { ActionCache } from '@convex-dev/action-cache'
 import RateLimiter, { MINUTE } from '@convex-dev/rate-limiter'
 import { v } from 'convex/values'
@@ -290,8 +288,8 @@ export const computeAccountWindowsSizes = internalAction({
       ownedGames,
       12,
       async (game: SteamOwnedGame): Promise<void> => {
-      const info = await appInfoCache.fetch(ctx, { appid: game.appid })
-      appInfoMap.set(game.appid, info)
+        const info = await appInfoCache.fetch(ctx, { appid: game.appid })
+        appInfoMap.set(game.appid, info)
       },
     )
 
