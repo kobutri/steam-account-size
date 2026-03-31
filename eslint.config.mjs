@@ -1,9 +1,7 @@
 import { defineConfig, globalIgnores } from 'eslint/config'
 import { tanstackConfig } from '@tanstack/eslint-config'
-import convexPlugin from '@convex-dev/eslint-plugin'
 
 export default defineConfig([
   ...tanstackConfig,
-  ...convexPlugin.configs.recommended,
-  globalIgnores(['.venv/**', '.output/**', '.vercel/**', 'convex/_generated']),
+  globalIgnores(['.venv/**', '.output/**', '.vercel/**', 'drizzle/**']),
 ])

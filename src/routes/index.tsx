@@ -1,15 +1,11 @@
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useServerFn } from '@tanstack/react-start'
-import { useAction } from 'convex/react'
 import { createFileRoute, stripSearchParams } from '@tanstack/react-router'
-import { api } from '../../convex/_generated/api'
 import type { HomeSearch } from '~/lib/homeSearch'
+import { formatBytes } from '~/lib/formatBytes'
 import { homeSearchDefaults, homeSearchSchema } from '~/lib/homeSearch'
-import { registerSteamLookupSession } from '~/lib/registerSteamLookupSession'
-import { getOrCreateSessionId } from '~/lib/sessionId'
-
-const SESSION_REFRESH_INTERVAL_MS = 30 * 60 * 1000
+import { lookupSteamAccount } from '~/lib/lookupSteamAccount'
 
 type SteamGameRow = {
   appid: number
@@ -36,42 +32,18 @@ export const Route = createFileRoute('/')({
 
 function Home() {
   const search = Route.useSearch()
-  const lookupAccount = useAction(api.steam.lookupAccount)
-  const registerSession = useServerFn(registerSteamLookupSession)
+  const lookupAccount = useServerFn(lookupSteamAccount)
   const { setAccount, setFilter, setHideFreeToPlay } = useHomeSearchState()
-  const [sessionId, setSessionId] = useState('')
   const deferredSearch = useDeferredValue(search.filter)
-
-  useEffect(() => {
-    setSessionId(getOrCreateSessionId())
-  }, [])
-
-  const sessionQuery = useQuery({
-    queryKey: ['steam-session', sessionId],
-    enabled: sessionId.length > 0,
-    retry: false,
-    staleTime: SESSION_REFRESH_INTERVAL_MS,
-    refetchInterval: SESSION_REFRESH_INTERVAL_MS,
-    refetchIntervalInBackground: true,
-    queryFn: async () => {
-      return registerSession({
-        data: {
-          sessionId,
-        },
-      })
-    },
-  })
 
   const lookupQuery = useQuery({
     queryKey: ['steam-account', search.account],
-    enabled:
-      search.account.trim().length > 0 &&
-      sessionId.length > 0 &&
-      sessionQuery.isSuccess,
+    enabled: search.account.trim().length > 0,
     queryFn: async () => {
       return lookupAccount({
-        account: search.account.trim(),
-        sessionId,
+        data: {
+          account: search.account.trim(),
+        },
       })
     },
   })
@@ -174,21 +146,12 @@ function Home() {
         />
         <button
           type="submit"
-          disabled={
-            lookupQuery.isFetching ||
-            sessionId.length === 0 ||
-            sessionQuery.isPending ||
-            sessionQuery.isError
-          }
+          disabled={lookupQuery.isFetching}
           className="h-11 border border-neutral-900 px-4 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {lookupQuery.isFetching ? 'Loading…' : 'Lookup'}
         </button>
       </form>
-
-      {sessionQuery.error ? (
-        <p className="mt-4 text-sm text-red-700">{sessionQuery.error.message}</p>
-      ) : null}
 
       {lookupQuery.error ? (
         <p className="mt-4 text-sm text-red-700">
@@ -280,18 +243,4 @@ function useHomeSearchState() {
     setHideFreeToPlay: (hideFreeToPlay: boolean) =>
       updateSearch((prev) => ({ ...prev, hideFreeToPlay }), { replace: true }),
   }
-}
-
-function formatBytes(numBytes: number) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  let value = numBytes
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  if (unitIndex === 0) {
-    return `${Math.round(value)} ${units[unitIndex]}`
-  }
-  return `${value.toFixed(2)} ${units[unitIndex]}`
 }
